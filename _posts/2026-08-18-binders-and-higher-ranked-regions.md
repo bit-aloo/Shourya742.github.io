@@ -119,5 +119,84 @@ You may be wondering why we have both of these variants, afterall the data store
 The main reason for this is that `Bound` is a more syntactic representation of bound variables whereas Placeholder is a more semantic representation. As a concrete example:
 
 ```rust
+impl<'a> Other<'a> for &'a u32 {}
 
+impl<T> Trait for T
+where
+    for<'a> T: Other<'a> 
+    { ... }
+
+impl<T> Bar for T
+where
+    for<'a> &'a T: Trait
+    { ... }
 ```
+
+Given these trait implementations, `u32: Bar` should not hold.`&'a u32` only implements `Other<'a>` when the lifetime of the borrow and the lifetime on the trait are equal. However, if we only used `ReBound` and did not have placeholders, it may be easy to accidentally believe that trait bound does hold. To explain this, let's walk through an example of trying to prove `u32: Bar` in a world where rustc did not have placeholders:
+
+* We start by trying to prove `u32: Bar`
+* We find the `impl<T> Bar for T` impl, we would wind up instantiating the `EarlyBinder`with `u32` (note: this is not quite accurate as we first instantiate the binder with an inference variable that we then infer to be `u32` but that distinction is not super important here)
+* There is a where clause `for<'a> &'^0 T: Trait` on the impl, as we instantiated the early binder with `u32` we actually have to prove `for<'a> &'^0 u32: Trait`.
+* We find the `impl<T> Trait for T` impl, we would wind up instantiating the `EarlyBinder` with `&'^0 u32`.
+* There is a where clause `for<'a> T: Other<'^0>`, as we instantiated the early binder with `&'^0 u32` we actually have to prove `for<'a> &'^0 u32: Other<'^0>`
+* We find the `impl<'a> Other<'a> for &'a u32` and this impl is enough to prove the bound as the lifetime on the borrow and on the trait are both `'^0`.
+
+This end result is incorrect as we have tow separate binders introducing their own generic parameters, the trait bound should have ended up as something like `for<'a1, 'a2> &'^1 u32: Other<'^0>` which is not satisfied by the `impl<'a> Other<'a> for &'a u32`.
+
+While in theory we could make this work it would be quite involved and more complex than the current setup, we would have to:
+
+* "rewrite" bound variables to have a higher `DebruijnIndex` whenever instantiating a `Binder/EarlyBinder` with a `Bound` ty/const/region
+* When inferring an inference variable to a bound var, if that bound var is from a binder entered after creating the infer var, we would have to lower the `DebruijnIndex` of the var.
+* Separately track what binder an inference variable was created inside of, also what the innermost binder it can name parameters from (currently we only have to track the latter)
+* When resolving inference variables rewrite any bound variables according to the current binder depth of the infcx.
+* Maybe more (while writing this list items kept getting added so it seems naive to think this is exhaustive).
+
+Fundamentally, all of this complexity is because `Bound` ty/const/region have a different representation for a given parameter on a `Binder` depending on how many other `Binder`s there are between the binder introducing the parameter, and its usage. For example, given the following code:
+
+```rust
+fn foo<T>()
+where
+    for<'a> T: Trait<'a, for<'b> fn(&'b T, &'a u32)>
+{ ... }
+```
+
+That where clause would be written as `for<'a> T: Trait<'^0, for<'b> fn(&'^0 T, &'^1_0 u32)>` Despite these being two references to the `'a`, they are both represented differently, `^0` and `^1_0`, due to the fact that the latter usage is nested under a second `Binder` for the inner function pointer type.
+
+This is in contrast to `Placeholder` ty/const/regions which do not have this limitation due to the fact that `Universe`s are specific to the current `InferCtxt` not the usage site of the parameter.
+
+It is trivially possible to instantiate `EarlyBinder`s and unify inference variables with existing `Placeholder`s as no matter what context the `Placeholder` is in, it will have the same representation. As an example, it we were to instantiate the binder on the higher ranked where clause from above, it would be represented like `T: Trait<'!1_0, for<'b> fn(&^0 T, &'!1_0 u32)>`. The `Replaceholder` representation for both usages of `'a` are the same despite one being underneath another Binder.
+
+If we were to then instantiate the binder on the function pointer we would get a type such as `fn(&'!2_0 T, ^'!1_0 u32)` the `RePlaceholder` for the `'b`parameter is in a higher universe to track the fact that its binder was instantiated after the binder for `'a`.
+
+## Instantiating with ReLateParam
+
+`RegionKind` has two variants for representing generic parameters, `ReLateParam` and `ReEarlyParam`. `ReLateParam` is conceptually a `Placeholder` that is always in the root universe (`U0`). It is used when instantiating late bound parameters of function/closures while inside of them. Its actual representation is relatively different from both `ReEarlyParam` and `RePlaceholder`.
+
+* A DefId for the item that introduced the late bound generic parameter
+* A `BoundRegionKind` which either specifies the DefId of the generic parameter and its name (via a Symbol), or that this placeholder is representing the anonymous lifetime of a `Fn`/ `FnMut` closure's self borrow. There is also a variant for `BrAnon` but this is not used for `ReLateParam`.
+
+For example, given the following code:
+
+```rust
+impl Trait for Whatever {
+    fn foo<'a>(a: &'a u32) -> &'a u32 {
+        let b: &'a u32 = a;
+        b
+    }
+}
+```
+
+the lifetime `'a` in the type `&'a u32` in the function body would be represented as:
+
+```rust
+ReLateParam(
+    {impl#0}::foo,
+    BoundRegionKind::BrNamed({impl#0}::foo::'a, "'a")
+)
+```
+
+In this specific case of referencing late bound generic parameters of a function from inside the body, this is done implicitly during `hir_ty_lowering`, rather than explicitly when instantiating a `Binder` somewhere. In some cases however, we do explicitly instantiate a `Binder` with `ReLateParam`s.
+
+Generally, whenever we have a Binder for late bound parameters oon a function/closure and we are conceptually inside of the binder already, we use `liberate_late_bound_regions` to instantiate it with `ReLateParam`s . That makes this operation the `Binder` equivalent to `EarlyBinder`s `instantiate_identity`.
+
+As a concrete example, accessing the signature of a function we are type checking will represented as `EarlyBinder<Binder<FnSig>>`. As we are already "inside" of these binders, we would call `instanttiate_identity` followed by `librate_late_bound_regions`
